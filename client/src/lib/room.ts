@@ -59,7 +59,15 @@ export type RoomSnapshot = {
 
 type IncomingInternal = IncomingFile & { parts: ArrayBuffer[] }
 type OutgoingInternal = OutgoingFile & { file: File }
-type PeerRecord = { name: string; state: PeerState; link: PeerLink; channel: RTCDataChannel | null }
+type PeerRecord = {
+  name: string
+  state: PeerState
+  link: PeerLink
+  channel: RTCDataChannel | null
+  disconnectTimer: number
+  giveUpTimer: number
+  retried: boolean
+}
 
 const EMPTY: RoomSnapshot = {
   socketStatus: 'connecting',
@@ -188,6 +196,25 @@ export function createRoomStore(options: { code: string; peerId: string; name: s
     }
   }
 
+  function markUnreachable(id: string) {
+    const peer = peers.get(id)
+    if (!peer || peer.state === 'failed') return
+    peer.state = 'failed'
+    failTransfers(id, 'Could not connect directly.')
+    emit(true)
+  }
+
+  function armGiveUp(id: string) {
+    const peer = peers.get(id)
+    if (!peer) return
+    window.clearTimeout(peer.giveUpTimer)
+    peer.giveUpTimer = window.setTimeout(() => {
+      const current = peers.get(id)
+      if (!alive || !current || current.state !== 'connecting') return
+      markUnreachable(id)
+    }, 25_000)
+  }
+
   function ensurePeer(id: string, name: string, role: 'offerer' | 'answerer') {
     const existing = peers.get(id)
     if (existing) {
@@ -195,39 +222,65 @@ export function createRoomStore(options: { code: string; peerId: string; name: s
       return existing
     }
     const link = createPeerLink({
+      polite: role === 'answerer',
       onSignal: (data) => socket.send({ type: 'signal', to: id, data }),
       onChannel: (channel) => wireChannel(id, channel),
       onState: (state) => {
         const peer = peers.get(id)
         if (!peer) return
-        if (state === 'failed' || state === 'disconnected') {
-          peer.state = 'failed'
-          failTransfers(id, 'Could not connect directly.')
-        } else if (state === 'closed') {
-          peer.state = 'closed'
-        } else if (state === 'connected' && peer.channel?.readyState === 'open') {
-          peer.state = 'connected'
+        if (state === 'connected') {
+          window.clearTimeout(peer.disconnectTimer)
+          window.clearTimeout(peer.giveUpTimer)
+          if (peer.channel?.readyState === 'open') peer.state = 'connected'
+          emit(true)
+          return
         }
-        emit(true)
+        if (state === 'disconnected') {
+          if (peer.channel?.readyState === 'open') return
+          window.clearTimeout(peer.disconnectTimer)
+          peer.disconnectTimer = window.setTimeout(() => {
+            const current = peers.get(id)
+            if (!alive || !current || current.state === 'connected') return
+            if (current.channel?.readyState === 'open') {
+              current.state = 'connected'
+              emit(true)
+              return
+            }
+            markUnreachable(id)
+          }, 8_000)
+          return
+        }
+        if (state === 'failed') {
+          window.clearTimeout(peer.disconnectTimer)
+          if (role === 'offerer' && !peer.retried) {
+            peer.retried = true
+            peer.state = 'connecting'
+            armGiveUp(id)
+            peer.link.restart()
+            emit(true)
+            return
+          }
+          markUnreachable(id)
+          return
+        }
+        if (state === 'closed') {
+          peer.state = 'closed'
+          emit(true)
+        }
       },
     })
-    const record: PeerRecord = { name, state: 'connecting', link, channel: null }
-    peers.set(id, record)
-    window.setTimeout(() => {
-      if (!alive) return
-      const peer = peers.get(id)
-      if (peer && peer.state === 'connecting') {
-        peer.state = 'failed'
-        failTransfers(id, 'Could not connect directly.')
-        emit(true)
-      }
-    }, 20_000)
-    if (role === 'offerer') {
-      link.start().catch(() => {
-        record.state = 'failed'
-        emit(true)
-      })
+    const record: PeerRecord = {
+      name,
+      state: 'connecting',
+      link,
+      channel: null,
+      disconnectTimer: 0,
+      giveUpTimer: 0,
+      retried: false,
     }
+    peers.set(id, record)
+    armGiveUp(id)
+    if (role === 'offerer') link.start()
     const queued = pendingSignals.get(id) ?? []
     pendingSignals.delete(id)
     for (const data of queued) {
@@ -257,7 +310,11 @@ export function createRoomStore(options: { code: string; peerId: string; name: s
     }
     if (message.type === 'peer-left') {
       const peer = peers.get(message.peerId)
-      peer?.link.close()
+      if (peer) {
+        window.clearTimeout(peer.disconnectTimer)
+        window.clearTimeout(peer.giveUpTimer)
+        peer.link.close()
+      }
       peers.delete(message.peerId)
       failTransfers(message.peerId, 'They left the room.')
       emit(true)
@@ -503,7 +560,11 @@ export function createRoomStore(options: { code: string; peerId: string; name: s
       for (const item of incoming.values()) {
         if (item.downloadUrl) URL.revokeObjectURL(item.downloadUrl)
       }
-      for (const peer of peers.values()) peer.link.close()
+      for (const peer of peers.values()) {
+        window.clearTimeout(peer.disconnectTimer)
+        window.clearTimeout(peer.giveUpTimer)
+        peer.link.close()
+      }
       socket.close()
       listeners.clear()
     },

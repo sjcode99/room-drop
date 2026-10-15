@@ -4,19 +4,27 @@ export type SignalData =
   | { kind: 'ice'; candidate: RTCIceCandidateInit }
 
 export type PeerLink = {
-  start: () => Promise<void>
+  start: () => void
+  restart: () => void
   handleSignal: (data: SignalData) => Promise<void>
   close: () => void
 }
 
-const ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }]
+const ICE_SERVERS: RTCIceServer[] = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+]
 
 export function createPeerLink(options: {
+  polite: boolean
   onSignal: (data: SignalData) => void
   onChannel: (channel: RTCDataChannel) => void
   onState: (state: RTCPeerConnectionState) => void
 }): PeerLink {
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
+  let makingOffer = false
+  let ignoreOffer = false
   let remoteReady = false
   const pendingIce: RTCIceCandidateInit[] = []
 
@@ -25,30 +33,46 @@ export function createPeerLink(options: {
   }
   pc.onconnectionstatechange = () => options.onState(pc.connectionState)
   pc.ondatachannel = (event) => options.onChannel(event.channel)
+  pc.onnegotiationneeded = () => {
+    void sendOffer()
+  }
 
-  async function flushIce() {
-    while (pendingIce.length > 0) {
-      const candidate = pendingIce.shift()
-      if (candidate) await pc.addIceCandidate(candidate)
+  async function sendOffer() {
+    try {
+      makingOffer = true
+      await pc.setLocalDescription()
+      const sdp = pc.localDescription?.sdp
+      if (sdp) options.onSignal({ kind: 'offer', sdp })
+    } finally {
+      makingOffer = false
     }
   }
 
+  async function flushIce() {
+    const queued = pendingIce.splice(0)
+    for (const candidate of queued) await pc.addIceCandidate(candidate)
+  }
+
   return {
-    async start() {
+    start() {
       const channel = pc.createDataChannel('files', { ordered: true })
       options.onChannel(channel)
-      const offer = await pc.createOffer()
-      await pc.setLocalDescription(offer)
-      options.onSignal({ kind: 'offer', sdp: pc.localDescription?.sdp ?? '' })
+    },
+    restart() {
+      pc.restartIce()
     },
     async handleSignal(data) {
       if (data.kind === 'offer') {
+        const collision = makingOffer || pc.signalingState !== 'stable'
+        ignoreOffer = !options.polite && collision
+        if (ignoreOffer) return
+        if (collision) await pc.setLocalDescription({ type: 'rollback' })
         await pc.setRemoteDescription({ type: 'offer', sdp: data.sdp })
         remoteReady = true
         await flushIce()
-        const answer = await pc.createAnswer()
-        await pc.setLocalDescription(answer)
-        options.onSignal({ kind: 'answer', sdp: pc.localDescription?.sdp ?? '' })
+        await pc.setLocalDescription()
+        const sdp = pc.localDescription?.sdp
+        if (sdp) options.onSignal({ kind: 'answer', sdp })
         return
       }
       if (data.kind === 'answer') {
@@ -58,12 +82,13 @@ export function createPeerLink(options: {
         await flushIce()
         return
       }
-      if (!remoteReady) pendingIce.push(data.candidate)
+      if (!remoteReady || !pc.remoteDescription) pendingIce.push(data.candidate)
       else await pc.addIceCandidate(data.candidate)
     },
     close() {
       pc.onicecandidate = null
       pc.ondatachannel = null
+      pc.onnegotiationneeded = null
       pc.close()
     },
   }
